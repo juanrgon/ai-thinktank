@@ -1,3 +1,17 @@
+# AI Thinktank
+
+AI Thinktank is a hard fork of Pi Coding Agent, reshaped around multiple lab agents working together in one serious terminal transcript.
+
+The first fork-specific entrypoint is `thinktank`:
+
+```bash
+thinktank "try to guess what the economy will look like once AI is able to replace all white-collar jobs?"
+```
+
+It selects configured OpenAI, Google, and Anthropic models from Pi's existing local provider/auth setup, prints a continuous multi-agent discussion, and stores durable session state under `~/.ai-thinktank/sessions`.
+
+---
+
 <p align="center">
   <a href="https://pi.dev">
     <img alt="pi logo" src="https://pi.dev/logo-auto.svg" width="128">
