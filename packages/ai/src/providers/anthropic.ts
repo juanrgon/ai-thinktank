@@ -7,7 +7,7 @@ import type {
 	RawMessageStreamEvent,
 } from "@anthropic-ai/sdk/resources/messages.js";
 import { getEnvApiKey } from "../env-api-keys.ts";
-import { calculateCost } from "../models.ts";
+import { calculateCost, clampThinkingLevel } from "../models.ts";
 import type {
 	AnthropicMessagesCompat,
 	Api,
@@ -736,14 +736,15 @@ export const streamSimpleAnthropic: StreamFunction<"anthropic-messages", SimpleS
 	}
 
 	const base = buildBaseOptions(model, options, apiKey);
-	if (!options?.reasoning) {
+	const reasoning = options?.reasoning ? clampThinkingLevel(model, options.reasoning) : undefined;
+	if (!reasoning || reasoning === "off") {
 		return streamAnthropic(model, context, { ...base, thinkingEnabled: false } satisfies AnthropicOptions);
 	}
 
 	// For Opus 4.6 and Sonnet 4.6: use adaptive thinking with effort level
 	// For older models: use budget-based thinking
 	if (supportsAdaptiveThinking(model.id)) {
-		const effort = mapThinkingLevelToEffort(model, options.reasoning);
+		const effort = mapThinkingLevelToEffort(model, reasoning);
 		return streamAnthropic(model, context, {
 			...base,
 			thinkingEnabled: true,
@@ -753,12 +754,7 @@ export const streamSimpleAnthropic: StreamFunction<"anthropic-messages", SimpleS
 
 	// Undefined means the caller did not request an output cap; let the helper use the model cap.
 	// Do not coerce to 0 here, or the thinking budget would become the entire max_tokens value.
-	const adjusted = adjustMaxTokensForThinking(
-		base.maxTokens,
-		model.maxTokens,
-		options.reasoning,
-		options.thinkingBudgets,
-	);
+	const adjusted = adjustMaxTokensForThinking(base.maxTokens, model.maxTokens, reasoning, options?.thinkingBudgets);
 
 	return streamAnthropic(model, context, {
 		...base,

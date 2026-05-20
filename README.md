@@ -5,10 +5,11 @@ AI Thinktank is a hard fork of Pi Coding Agent, reshaped around multiple lab age
 The first fork-specific entrypoint is `thinktank`:
 
 ```bash
+thinktank
 thinktank "try to guess what the economy will look like once AI is able to replace all white-collar jobs?"
 ```
 
-It selects configured OpenAI, Google, and Anthropic models from Pi's existing local provider/auth setup, prints a continuous multi-agent discussion, and stores durable session state under `~/.ai-thinktank/sessions`.
+It selects configured OpenAI, Google, and Anthropic models from Pi's existing local provider/auth setup, opens a Pi-skinned terminal room for the multi-agent discussion, and stores durable session state under `~/.ai-thinktank/sessions`.
 
 ---
 

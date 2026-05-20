@@ -12,6 +12,30 @@ The Thinktank-specific behavior should be expressed through that agent loop: mul
 
 The CLI should not expose separate user-facing modes. The Human Participant should experience the session as a single continuous conversation with the Lab Agents.
 
+Pi-compatible slash commands may exist for control-plane operations such as choosing Lab Agent models, changing local settings, or toggling views. The canonical command for viewing and changing Lab Agent model selection is `/roster`. Bare `/roster` should open a Pi-style Roster Selector rather than introduce a new argument-heavy command language. Pi Control Commands should not replace natural-language steering for the substantive work of the Thinktank Session.
+
+Roster choices should be session-scoped first. The initial Roster Selector should focus on the Core Lab Roster slots: OpenAI, Google, and Anthropic. Each slot should offer configured Pi models from its lab's provider family by default so Model Provenance remains clear. Cross-family providers such as GitHub Copilot may appear in multiple slots when the concrete model identity clearly belongs to that lab family, for example `github-copilot/gpt-*`, `github-copilot/gemini-*`, or `github-copilot/claude-*`. When a Human Participant resumes a Thinktank Session, the selected Lab Agent models should restore with that session. A later Pi-style settings action may save the current roster as the default for new sessions.
+
+The Roster Command may show the current roster while the room is working, but the first implementation should only commit roster changes while the Room Runtime is idle between turns.
+
+Committed roster changes should appear in the Session Transcript as Public Configuration Events, not as Lab Agent conversational turns.
+
+The Room View should use Pi's existing terminal skin: the TUI shell, editor, markdown treatment, theme, and footer/status posture should feel like Pi Coding Agent, with the single-agent transcript replaced by a visible multi-agent room.
+
+The footer should include a Compact Roster Indicator when space allows, while `/roster` provides full provider and model details.
+
+The Room View should be implemented from Pi's actual interactive runtime path. The first implementation step should be a thin copied fork of the relevant Pi `InteractiveMode` and `AgentSessionRuntime` path into Thinktank-specific files. Keep the copied path recognizable and working first; then reshape it around the Room Runtime, Lab Agent Runtimes, and Room View instead of maintaining a separate Thinktank-specific mini-TUI.
+
+The standalone Thinktank TUI prototype should not receive product features such as `/roster`. Before implementing roster selection, the active entrypoint should move toward the forked Pi interactive runtime path.
+
+The first vertical slice should use a Room Runtime coordinating one Pi-derived Lab Agent Runtime per participating Lab Agent. This keeps each Lab Agent close to Pi's normal agent loop while allowing the room to own the shared transcript and collaboration semantics.
+
+Tool-Mediated Work should preserve Pi's existing tool path where possible. Lab Agent Runtimes initiate ordinary reads, searches, and bash work through their Pi-derived tool streams; the Room Runtime observes those actions, renders them publicly, and records them. Edits and writes require Room Runtime mediation through Pre-Edit Deliberation and Coordinated Write rules.
+
+Lab Agent Runtimes should share context through Room Runtime injection, not by sharing one private message array. Before a Lab Agent takes a turn, the Room Runtime provides the current Session Brief, relevant public transcript excerpts, Agent Roster and Model Provenance, and Action Summaries.
+
+Human input should route through the Room Runtime first. The Room Runtime records human turns, handles Pi Control Commands such as `/roster`, and injects substantive room messages into Lab Agent Runtimes.
+
 After the initial contributions, the visible conversation should use Natural Turn Taking rather than fixed round-robin ordering. Each eligible Lab Agent privately forms a Turn Impulse after a visible turn, and the next visible speaker emerges from those impulses. The next speaker should not be the Lab Agent who spoke most recently. If every eligible Lab Agent passes, a non-last Lab Agent should fill the silence by synthesizing or moving the conversation forward.
 
 ## Scenario

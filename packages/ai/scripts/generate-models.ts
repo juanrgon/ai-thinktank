@@ -141,6 +141,7 @@ const OPENAI_RESPONSES_NONE_REASONING_MODELS = new Set([
 	"gpt-5.4-nano",
 	"gpt-5.5",
 ]);
+const COPILOT_MEDIUM_ONLY_REASONING_MODELS = new Set(["claude-opus-4.7"]);
 
 function mergeThinkingLevelMap(model: Model<any>, map: NonNullable<Model<any>["thinkingLevelMap"]>): void {
 	model.thinkingLevelMap = { ...model.thinkingLevelMap, ...map };
@@ -215,6 +216,9 @@ function applyThinkingLevelMetadata(model: Model<any>): void {
 	}
 	if (model.id.includes("opus-4-7") || model.id.includes("opus-4.7")) {
 		mergeThinkingLevelMap(model, { xhigh: "xhigh" });
+	}
+	if (model.provider === "github-copilot" && COPILOT_MEDIUM_ONLY_REASONING_MODELS.has(model.id)) {
+		mergeThinkingLevelMap(model, { minimal: null, low: null, high: null, xhigh: null });
 	}
 	if (model.api === "openai-completions" && model.id.includes("deepseek-v4")) {
 		mergeThinkingLevelMap(model, DEEPSEEK_V4_THINKING_LEVEL_MAP);

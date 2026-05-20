@@ -4,7 +4,8 @@
 
 ### Added
 
-- Added an initial `thinktank` CLI entrypoint that runs configured OpenAI, Google, and Anthropic models as a shared terminal-room transcript using Pi's local model and authentication setup.
+- Added an initial `thinktank` CLI entrypoint that runs configured OpenAI, Google, and Anthropic models as a shared Pi-skinned terminal room using Pi's local model and authentication setup.
+- Added no-argument `thinktank` startup that opens the terminal room and waits for the first user message.
 
 ## [0.75.4] - 2026-05-20
 

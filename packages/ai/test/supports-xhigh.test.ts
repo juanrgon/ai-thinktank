@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { getModel, getSupportedThinkingLevels } from "../src/models.ts";
+import { clampThinkingLevel, getModel, getSupportedThinkingLevels } from "../src/models.ts";
 
 describe("getSupportedThinkingLevels", () => {
 	it("includes xhigh for Anthropic Opus 4.6 on anthropic-messages API", () => {
@@ -12,6 +12,14 @@ describe("getSupportedThinkingLevels", () => {
 		const model = getModel("anthropic", "claude-opus-4-7");
 		expect(model).toBeDefined();
 		expect(getSupportedThinkingLevels(model!)).toContain("xhigh");
+	});
+
+	it("only exposes medium reasoning for Copilot Claude Opus 4.7", () => {
+		const model = getModel("github-copilot", "claude-opus-4.7");
+		expect(model).toBeDefined();
+		expect(getSupportedThinkingLevels(model!)).toEqual(["off", "medium"]);
+		expect(clampThinkingLevel(model!, "high")).toBe("medium");
+		expect(clampThinkingLevel(model!, "low")).toBe("medium");
 	});
 
 	it("does not include xhigh for non-Opus Anthropic models", () => {

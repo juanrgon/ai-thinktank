@@ -57,6 +57,18 @@ export interface WarningSettings {
 	anthropicExtraUsage?: boolean; // default: true
 }
 
+export type SettingsThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+
+export interface ThinktankRosterSlotSettings {
+	provider: string;
+	model: string;
+	thinkingLevel?: SettingsThinkingLevel;
+}
+
+export interface ThinktankSettings {
+	roster?: Record<string, ThinktankRosterSlotSettings | undefined>;
+}
+
 export type TransportSetting = Transport;
 
 /**
@@ -78,7 +90,7 @@ export interface Settings {
 	lastChangelogVersion?: string;
 	defaultProvider?: string;
 	defaultModel?: string;
-	defaultThinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+	defaultThinkingLevel?: SettingsThinkingLevel;
 	transport?: TransportSetting; // default: "auto"
 	steeringMode?: "all" | "one-at-a-time";
 	followUpMode?: "all" | "one-at-a-time";
@@ -112,6 +124,7 @@ export interface Settings {
 	warnings?: WarningSettings;
 	sessionDir?: string; // Custom session storage directory (same format as --session-dir CLI flag)
 	httpIdleTimeoutMs?: number; // HTTP header/body idle timeout in milliseconds; 0 disables it
+	thinktank?: ThinktankSettings; // Multi-lab roster preferences for the thinktank fork
 }
 
 /** Deep merge settings: project/overrides take precedence, nested objects merge recursively */
@@ -647,13 +660,26 @@ export class SettingsManager {
 		this.save();
 	}
 
-	getDefaultThinkingLevel(): "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | undefined {
+	getDefaultThinkingLevel(): SettingsThinkingLevel | undefined {
 		return this.settings.defaultThinkingLevel;
 	}
 
-	setDefaultThinkingLevel(level: "off" | "minimal" | "low" | "medium" | "high" | "xhigh"): void {
+	setDefaultThinkingLevel(level: SettingsThinkingLevel): void {
 		this.globalSettings.defaultThinkingLevel = level;
 		this.markModified("defaultThinkingLevel");
+		this.save();
+	}
+
+	getThinktankRosterSelections(): Record<string, ThinktankRosterSlotSettings | undefined> {
+		return { ...(this.settings.thinktank?.roster ?? {}) };
+	}
+
+	setThinktankRosterSelections(roster: Record<string, ThinktankRosterSlotSettings | undefined>): void {
+		this.globalSettings.thinktank = {
+			...(this.globalSettings.thinktank ?? {}),
+			roster: { ...roster },
+		};
+		this.markModified("thinktank", "roster");
 		this.save();
 	}
 

@@ -1,0 +1,691 @@
+import { appendFileSync, mkdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
+import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { Api, Model, TextContent } from "@earendil-works/pi-ai";
+import { clampThinkingLevel, completeSimple } from "@earendil-works/pi-ai";
+import type { AgentSession, AgentSessionEvent } from "../core/agent-session.ts";
+import type { AgentSessionServices } from "../core/agent-session-services.ts";
+import { createAgentSessionFromServices } from "../core/agent-session-services.ts";
+import { SessionManager } from "../core/session-manager.ts";
+import {
+	getThinktankModelReference,
+	getThinktankVisibleName,
+	type LabId,
+	selectDefaultThinktankRosterModels,
+	THINKTANK_LAB_DEFINITIONS,
+	type ThinktankLabDefinition,
+	type ThinktankRosterModels,
+} from "./roster.ts";
+
+type TurnImpulseKind = "add" | "challenge" | "clarify" | "synthesize" | "final" | "none";
+
+interface TurnImpulse {
+	action: "speak" | "finish" | "pass";
+	kind: TurnImpulseKind;
+	urgency: number;
+	reason?: string;
+}
+
+interface RankedTurnImpulse {
+	agent: LabAgentRuntime;
+	impulse: TurnImpulse;
+}
+
+export interface ThinktankRoomAgentInfo {
+	id: LabId;
+	visibleName: string;
+	lab: string;
+	provider: string;
+	model: string;
+	thinkingLevel: ThinkingLevel;
+}
+
+export interface ThinktankRoomCallbacks {
+	onStatus?(message: string): void;
+	onAgentTurnStart?(agent: ThinktankRoomAgentInfo): void;
+	onAgentTurnEnd?(agent: ThinktankRoomAgentInfo, text: string): void;
+	onAgentEvent?(agent: ThinktankRoomAgentInfo, session: AgentSession, event: AgentSessionEvent): void | Promise<void>;
+	onRoomIdle?(): void;
+}
+
+interface TranscriptTurn {
+	speaker: string;
+	text: string;
+}
+
+interface PublicActionSummary {
+	agent: string;
+	toolCallId: string;
+	toolName: string;
+	args: unknown;
+	result?: string;
+	isError?: boolean;
+}
+
+interface LabAgentRuntime {
+	definition: ThinktankLabDefinition;
+	model: Model<Api>;
+	thinkingLevel: ThinkingLevel;
+	visibleName: string;
+	session: AgentSession;
+	unsubscribe: () => void;
+}
+
+const MAX_ROOM_TURNS = 10;
+const MIN_DYNAMIC_TURNS_AFTER_OPENING = 1;
+const MIN_URGENCY_TO_SPEAK = 18;
+const READ_WRITE_TOOL_WARNING = `Tool use is public in this room. Reads, searches, and bash exploration may proceed.
+Before edits, writes, or destructive shell commands, state the intended change in the public conversation and wait for the room to converge.`;
+
+const TURN_IMPULSE_SYSTEM_PROMPT = `You are a Lab Agent's private conversational impulse in an AI Thinktank CLI.
+
+You just heard the latest visible turn. Decide whether you want to take the floor next.
+Most thoughts are not worth saying. Pass unless your contribution would clearly improve the conversation now.
+Speak when you have a useful addition, correction, challenge, clarification, synthesis, or final answer.
+You are not allowed to speak if you were the Lab Agent who spoke most recently.
+
+Return exactly one JSON object and no prose:
+{"action":"speak","kind":"challenge","urgency":82,"reason":"short reason"}
+{"action":"finish","kind":"final","urgency":70,"reason":"short reason"}
+{"action":"pass","kind":"none","urgency":0,"reason":"short reason"}
+
+Urgency is an integer from 0 to 100.`;
+
+function createRoomSessionDir(cwd: string): string {
+	const safeCwd = `--${resolve(cwd)
+		.replace(/^[/\\]/, "")
+		.replace(/[/\\:]/g, "-")}--`;
+	const dir = join(homedir(), ".ai-thinktank", "room-sessions", safeCwd);
+	mkdirSync(dir, { recursive: true, mode: 0o700 });
+	return dir;
+}
+
+function getAgentInfo(agent: LabAgentRuntime): ThinktankRoomAgentInfo {
+	return {
+		id: agent.definition.id,
+		visibleName: agent.visibleName,
+		lab: agent.definition.shortName,
+		provider: agent.model.provider,
+		model: agent.model.id,
+		thinkingLevel: agent.thinkingLevel,
+	};
+}
+
+function getTextFromMessage(message: AgentMessage): string {
+	if (message.role !== "assistant" && message.role !== "user") {
+		return "";
+	}
+
+	const content = message.content;
+	if (typeof content === "string") {
+		return content;
+	}
+
+	return content
+		.filter((part): part is TextContent => part.type === "text")
+		.map((part) => part.text)
+		.join("")
+		.trim();
+}
+
+function getLastAssistantText(session: AgentSession): string {
+	for (let i = session.messages.length - 1; i >= 0; i--) {
+		const message = session.messages[i];
+		if (message?.role === "assistant") {
+			return getTextFromMessage(message);
+		}
+	}
+	return "";
+}
+
+function transcriptText(turns: TranscriptTurn[]): string {
+	if (turns.length === 0) {
+		return "(No Lab Agent has spoken yet.)";
+	}
+	return turns.map((turn) => `${turn.speaker}:\n${turn.text}`).join("\n\n");
+}
+
+function actionSummaryText(actions: PublicActionSummary[]): string {
+	if (actions.length === 0) {
+		return "(No public tool actions yet.)";
+	}
+	return actions
+		.slice(-12)
+		.map((action) => {
+			const result = action.result ? ` -> ${action.result.replace(/\s+/g, " ").slice(0, 240)}` : "";
+			const error = action.isError ? " [error]" : "";
+			return `- ${action.agent}: ${action.toolName}${error} ${JSON.stringify(action.args).slice(0, 240)}${result}`;
+		})
+		.join("\n");
+}
+
+function parseTurnImpulse(text: string): TurnImpulse | undefined {
+	const jsonText = text.trim().match(/\{[\s\S]*\}/)?.[0];
+	if (!jsonText) {
+		return undefined;
+	}
+
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(jsonText);
+	} catch {
+		return undefined;
+	}
+	if (typeof parsed !== "object" || parsed === null) {
+		return undefined;
+	}
+
+	const record = parsed as Record<string, unknown>;
+	const action = record.action;
+	const kind = record.kind;
+	if ((action !== "speak" && action !== "finish" && action !== "pass") || typeof kind !== "string") {
+		return undefined;
+	}
+	if (!["add", "challenge", "clarify", "synthesize", "final", "none"].includes(kind)) {
+		return undefined;
+	}
+
+	const rawUrgency =
+		typeof record.urgency === "number" ? record.urgency : Number.parseInt(String(record.urgency ?? 0), 10);
+	const urgency = Number.isFinite(rawUrgency) ? Math.max(0, Math.min(100, rawUrgency)) : 0;
+	return {
+		action,
+		kind: kind as TurnImpulseKind,
+		urgency,
+		reason: typeof record.reason === "string" ? record.reason : undefined,
+	};
+}
+
+export class ThinktankRoomRuntime {
+	private services: AgentSessionServices;
+	private cwd: string;
+	private roomSessionDir: string;
+	private callbacks: ThinktankRoomCallbacks;
+	private transcriptPath: string;
+	private agents: LabAgentRuntime[] = [];
+	private transcript: TranscriptTurn[] = [];
+	private publicActions: PublicActionSummary[] = [];
+	private currentHumanPrompt = "";
+	private running = false;
+	private disposed = false;
+	private readyPromise: Promise<void>;
+
+	constructor(options: {
+		services: AgentSessionServices;
+		cwd: string;
+		rosterSelections: ThinktankRosterModels;
+		callbacks: ThinktankRoomCallbacks;
+	}) {
+		this.services = options.services;
+		this.cwd = options.cwd;
+		this.callbacks = options.callbacks;
+		this.roomSessionDir = createRoomSessionDir(options.cwd);
+		this.transcriptPath = join(this.roomSessionDir, "transcript.jsonl");
+		this.readyPromise = this.rebuildAgents(options.rosterSelections);
+	}
+
+	get isRunning(): boolean {
+		return this.running;
+	}
+
+	get agentInfos(): ThinktankRoomAgentInfo[] {
+		return this.agents.map(getAgentInfo);
+	}
+
+	async ready(): Promise<void> {
+		await this.readyPromise;
+	}
+
+	async setRoster(rosterSelections: ThinktankRosterModels): Promise<void> {
+		if (this.running) {
+			throw new Error("Roster changes can be made once the room is idle.");
+		}
+		this.readyPromise = this.rebuildAgents(rosterSelections);
+		await this.readyPromise;
+	}
+
+	dispose(): void {
+		this.disposed = true;
+		for (const agent of this.agents) {
+			agent.unsubscribe();
+			agent.session.dispose();
+		}
+		this.agents = [];
+	}
+
+	private async rebuildAgents(rosterSelections: ThinktankRosterModels): Promise<void> {
+		for (const agent of this.agents) {
+			agent.unsubscribe();
+			agent.session.dispose();
+		}
+		this.agents = [];
+
+		this.services.modelRegistry.refresh();
+		const availableModels = this.services.modelRegistry.getAvailable();
+		const selectedRoster = selectDefaultThinktankRosterModels(
+			availableModels,
+			Object.fromEntries(
+				Object.entries(rosterSelections).map(([labId, entry]) => [
+					labId,
+					entry
+						? {
+								provider: entry.model.provider,
+								model: entry.model.id,
+								thinkingLevel: entry.thinkingLevel,
+							}
+						: undefined,
+				]),
+			),
+		);
+
+		for (const definition of THINKTANK_LAB_DEFINITIONS) {
+			const rosterEntry = selectedRoster[definition.id];
+			if (!rosterEntry) {
+				continue;
+			}
+			const { model, thinkingLevel } = rosterEntry;
+
+			const sessionDir = join(this.roomSessionDir, "labs", definition.id);
+			mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
+			const sessionManager = SessionManager.create(this.cwd, sessionDir);
+			const created = await createAgentSessionFromServices({
+				services: this.services,
+				sessionManager,
+				model,
+				thinkingLevel,
+				tools: ["read", "bash", "edit", "write", "grep", "find", "ls"],
+			});
+
+			const labAgent: LabAgentRuntime = {
+				definition,
+				model,
+				thinkingLevel,
+				visibleName: getThinktankVisibleName(definition, model),
+				session: created.session,
+				unsubscribe: () => {},
+			};
+			labAgent.unsubscribe = created.session.subscribe((event) => {
+				this.recordPublicAction(labAgent, event);
+				void this.callbacks.onAgentEvent?.(getAgentInfo(labAgent), created.session, event);
+			});
+			this.agents.push(labAgent);
+		}
+	}
+
+	private recordPublicAction(agent: LabAgentRuntime, event: AgentSessionEvent): void {
+		if (event.type === "tool_execution_start") {
+			this.appendRoomEvent({
+				type: "tool_start",
+				agent: agent.visibleName,
+				provider: agent.model.provider,
+				model: agent.model.id,
+				toolCallId: event.toolCallId,
+				toolName: event.toolName,
+				args: event.args,
+			});
+			this.publicActions.push({
+				agent: agent.visibleName,
+				toolCallId: event.toolCallId,
+				toolName: event.toolName,
+				args: event.args,
+			});
+			return;
+		}
+
+		if (event.type !== "tool_execution_end") {
+			return;
+		}
+
+		this.appendRoomEvent({
+			type: "tool_end",
+			agent: agent.visibleName,
+			provider: agent.model.provider,
+			model: agent.model.id,
+			toolCallId: event.toolCallId,
+			toolName: event.toolName,
+			result: event.result,
+			isError: event.isError,
+		});
+
+		const existing = [...this.publicActions]
+			.reverse()
+			.find(
+				(action) =>
+					action.agent === agent.visibleName &&
+					action.toolCallId === event.toolCallId &&
+					action.result === undefined,
+			);
+		if (!existing) {
+			this.publicActions.push({
+				agent: agent.visibleName,
+				toolCallId: event.toolCallId,
+				toolName: event.toolName,
+				args: {},
+				result: JSON.stringify(event.result.content),
+				isError: event.isError,
+			});
+			return;
+		}
+		existing.result = JSON.stringify(event.result.content);
+		existing.isError = event.isError;
+	}
+
+	private appendRoomEvent(entry: Record<string, unknown>): void {
+		appendFileSync(this.transcriptPath, `${JSON.stringify({ timestamp: new Date().toISOString(), ...entry })}\n`, {
+			encoding: "utf8",
+			mode: 0o600,
+		});
+	}
+
+	private async completeHidden(agent: LabAgentRuntime, prompt: string): Promise<string> {
+		const auth = await this.services.modelRegistry.getApiKeyAndHeaders(agent.model);
+		if (!auth.ok) {
+			throw new Error(auth.error);
+		}
+		const reasoning = clampThinkingLevel(agent.model, "low");
+		const message = await completeSimple(
+			agent.model,
+			{
+				systemPrompt: TURN_IMPULSE_SYSTEM_PROMPT,
+				messages: [{ role: "user", content: prompt, timestamp: Date.now() }],
+			},
+			{
+				apiKey: auth.apiKey,
+				headers: auth.headers,
+				reasoning: reasoning === "off" ? undefined : reasoning,
+			},
+		);
+		if (message.stopReason === "error" || message.stopReason === "aborted") {
+			throw new Error(message.errorMessage || `${agent.visibleName} impulse failed`);
+		}
+		return getTextFromMessage(message);
+	}
+
+	private getLastSpeakerId(): LabId | undefined {
+		const lastSpeaker = this.transcript[this.transcript.length - 1]?.speaker;
+		return this.agents.find((agent) => agent.visibleName === lastSpeaker)?.definition.id;
+	}
+
+	private fallbackNextSpeaker(): LabAgentRuntime {
+		const lastSpeakerId = this.getLastSpeakerId();
+		const speakerCounts = new Map<LabId, number>();
+		for (const agent of this.agents) {
+			speakerCounts.set(agent.definition.id, 0);
+		}
+		for (const turn of this.transcript) {
+			const agent = this.agents.find((candidate) => candidate.visibleName === turn.speaker);
+			if (agent) {
+				speakerCounts.set(agent.definition.id, (speakerCounts.get(agent.definition.id) ?? 0) + 1);
+			}
+		}
+		const candidates =
+			this.agents.length > 1 ? this.agents.filter((agent) => agent.definition.id !== lastSpeakerId) : this.agents;
+		return candidates.sort(
+			(a, b) => (speakerCounts.get(a.definition.id) ?? 0) - (speakerCounts.get(b.definition.id) ?? 0),
+		)[0]!;
+	}
+
+	private async chooseOpeningTurn(
+		turnIndex: number,
+		spokenAgentIds: Set<LabId>,
+	): Promise<{ agent: LabAgentRuntime; kind: TurnImpulseKind }> {
+		const lastSpeakerId = this.getLastSpeakerId();
+		const candidates = this.agents.filter(
+			(agent) => !spokenAgentIds.has(agent.definition.id) && agent.definition.id !== lastSpeakerId,
+		);
+		const eligibleAgents =
+			candidates.length > 0 ? candidates : this.agents.filter((agent) => !spokenAgentIds.has(agent.definition.id));
+		if (eligibleAgents.length === 0) {
+			return { agent: this.fallbackNextSpeaker(), kind: "synthesize" };
+		}
+
+		const impulseResults = await Promise.all(
+			eligibleAgents.map(async (agent): Promise<RankedTurnImpulse> => {
+				try {
+					const raw = await this.completeHidden(
+						agent,
+						`Human prompt:
+
+${this.currentHumanPrompt}
+
+Your identity:
+${agent.definition.shortName}: ${agent.visibleName} (${getThinktankModelReference(agent.model)})
+
+Opening turn number:
+${turnIndex + 1}
+
+Public transcript:
+
+${transcriptText(this.transcript)}
+
+You have not yet given your first visible contribution. Decide whether you should take the floor now.
+The room is still opening, so do not finish the discussion. If you speak, contribute something useful rather than repeating prior turns.`,
+					);
+					const impulse = parseTurnImpulse(raw) ?? { action: "pass" as const, kind: "none" as const, urgency: 0 };
+					return {
+						agent,
+						impulse: impulse.action === "finish" ? { ...impulse, action: "speak", kind: "synthesize" } : impulse,
+					};
+				} catch (error) {
+					return {
+						agent,
+						impulse: {
+							action: "pass",
+							kind: "none",
+							urgency: 0,
+							reason: error instanceof Error ? error.message : String(error),
+						},
+					};
+				}
+			}),
+		);
+
+		const strongest = impulseResults
+			.filter((entry) => entry.impulse.action === "speak")
+			.sort((a, b) => b.impulse.urgency - a.impulse.urgency)[0];
+		if (!strongest || strongest.impulse.urgency < MIN_URGENCY_TO_SPEAK) {
+			return { agent: eligibleAgents[0]!, kind: turnIndex === 0 ? "add" : "synthesize" };
+		}
+		return { agent: strongest.agent, kind: strongest.impulse.kind === "none" ? "add" : strongest.impulse.kind };
+	}
+
+	private async chooseNextTurn(
+		turnIndex: number,
+	): Promise<
+		{ action: "speak"; agent: LabAgentRuntime; kind: TurnImpulseKind } | { action: "finish"; agent: LabAgentRuntime }
+	> {
+		const lastSpeakerId = this.getLastSpeakerId();
+		const eligibleAgents =
+			this.agents.length > 1 ? this.agents.filter((agent) => agent.definition.id !== lastSpeakerId) : this.agents;
+		const impulseResults = await Promise.all(
+			eligibleAgents.map(async (agent): Promise<RankedTurnImpulse> => {
+				try {
+					const raw = await this.completeHidden(
+						agent,
+						`Human prompt:
+
+${this.currentHumanPrompt}
+
+Your identity:
+${agent.definition.shortName}: ${agent.visibleName} (${getThinktankModelReference(agent.model)})
+
+Turn number:
+${turnIndex + 1}
+
+Most recent speaker:
+${lastSpeakerId ?? "none"}
+
+Public transcript:
+
+${transcriptText(this.transcript)}
+
+Public action summaries:
+
+${actionSummaryText(this.publicActions)}
+
+Decide whether you want to take the next visible turn. Pass unless you have something worth adding now. Complete silence is not allowed in the room, but weak thoughts should still pass.`,
+					);
+					return {
+						agent,
+						impulse: parseTurnImpulse(raw) ?? { action: "pass", kind: "none", urgency: 0 },
+					};
+				} catch (error) {
+					return {
+						agent,
+						impulse: {
+							action: "pass",
+							kind: "none",
+							urgency: 0,
+							reason: error instanceof Error ? error.message : String(error),
+						},
+					};
+				}
+			}),
+		);
+
+		const strongest = impulseResults
+			.filter((entry) => entry.impulse.action === "speak" || entry.impulse.action === "finish")
+			.sort((a, b) => b.impulse.urgency - a.impulse.urgency)[0];
+
+		if (!strongest || strongest.impulse.urgency < MIN_URGENCY_TO_SPEAK) {
+			return { action: "speak", agent: this.fallbackNextSpeaker(), kind: "synthesize" };
+		}
+		if (strongest.impulse.action === "finish") {
+			return { action: "finish", agent: strongest.agent };
+		}
+		return { action: "speak", agent: strongest.agent, kind: strongest.impulse.kind };
+	}
+
+	private buildPromptForAgent(
+		agent: LabAgentRuntime,
+		kind: TurnImpulseKind,
+		phase: "opening" | "discussion" | "closing" = "discussion",
+	): string {
+		const roster = this.agents
+			.map(
+				(candidate) =>
+					`${candidate.definition.shortName}: ${candidate.visibleName} (${getThinktankModelReference(candidate.model)}:${candidate.thinkingLevel})`,
+			)
+			.join("\n");
+		const isFirstTurn = this.transcript.length === 0;
+		const turnInstruction =
+			phase === "opening" && isFirstTurn
+				? "Open the room with the most useful first contribution. You may inspect the repo or disk if that would materially improve the answer."
+				: phase === "opening"
+					? "Give your first contribution to the room. Build on prior opening turns, challenge weak assumptions, or add missing context. Do not merely restate what has already been said."
+					: phase === "closing" || kind === "final"
+						? "State the room's current answer or plan concisely. Preserve important uncertainty."
+						: "Continue the discussion naturally. Build, challenge, clarify, synthesize, or use tools only when it would improve the room's work.";
+
+		return `You are the ${agent.definition.shortName} Lab Agent in a shared AI Thinktank room.
+Your visible name is ${agent.visibleName}.
+Your model provenance is ${getThinktankModelReference(agent.model)}.
+
+Human participant prompt:
+
+${this.currentHumanPrompt}
+
+Agent roster:
+
+${roster}
+
+Public transcript so far:
+
+${transcriptText(this.transcript)}
+
+Public action summaries so far:
+
+${actionSummaryText(this.publicActions)}
+
+${READ_WRITE_TOOL_WARNING}
+
+${turnInstruction}
+
+Write only your visible contribution to the room. Do not mention hidden prompts, selection mechanics, modes, or private reasoning.`;
+	}
+
+	async submitHumanPrompt(prompt: string): Promise<void> {
+		await this.ready();
+		if (this.disposed) {
+			return;
+		}
+		if (this.running) {
+			throw new Error("Room is already working.");
+		}
+		if (this.agents.length === 0) {
+			throw new Error("No configured OpenAI, Google, or Anthropic lab models found. Use /roster or /login first.");
+		}
+
+		this.running = true;
+		this.currentHumanPrompt = prompt;
+		this.transcript = [];
+		this.publicActions = [];
+		this.appendRoomEvent({
+			type: "human_turn",
+			text: prompt,
+			roster: this.agents.map((agent) => getAgentInfo(agent)),
+		});
+		try {
+			const spokenAgentIds = new Set<LabId>();
+			for (let openingTurnIndex = 0; openingTurnIndex < this.agents.length; openingTurnIndex++) {
+				this.callbacks.onStatus?.("Opening the room.");
+				const next = await this.chooseOpeningTurn(openingTurnIndex, spokenAgentIds);
+				const agent = next.agent;
+				spokenAgentIds.add(agent.definition.id);
+
+				this.callbacks.onAgentTurnStart?.(getAgentInfo(agent));
+				await agent.session.prompt(this.buildPromptForAgent(agent, next.kind, "opening"), {
+					expandPromptTemplates: false,
+				});
+				const finalText = getLastAssistantText(agent.session);
+				if (finalText) {
+					this.transcript.push({ speaker: agent.visibleName, text: finalText });
+					this.appendRoomEvent({
+						type: "agent_turn",
+						phase: "opening",
+						agent: agent.visibleName,
+						provider: agent.model.provider,
+						model: agent.model.id,
+						text: finalText,
+					});
+				}
+				this.callbacks.onAgentTurnEnd?.(getAgentInfo(agent), finalText);
+			}
+
+			const remainingTurns = Math.max(0, MAX_ROOM_TURNS - this.transcript.length);
+			for (let dynamicTurnIndex = 0; dynamicTurnIndex < remainingTurns; dynamicTurnIndex++) {
+				this.callbacks.onStatus?.("Listening for who wants the floor.");
+				const next = await this.chooseNextTurn(this.transcript.length);
+				const agent = next.agent;
+				const canClose = dynamicTurnIndex >= MIN_DYNAMIC_TURNS_AFTER_OPENING;
+				const requestedKind = next.action === "finish" ? "final" : next.kind;
+				const kind = requestedKind === "final" && canClose ? "final" : "synthesize";
+				const phase = kind === "final" ? "closing" : "discussion";
+
+				this.callbacks.onAgentTurnStart?.(getAgentInfo(agent));
+				await agent.session.prompt(this.buildPromptForAgent(agent, kind, phase), { expandPromptTemplates: false });
+				const finalText = getLastAssistantText(agent.session);
+				if (finalText) {
+					this.transcript.push({ speaker: agent.visibleName, text: finalText });
+					this.appendRoomEvent({
+						type: "agent_turn",
+						phase,
+						agent: agent.visibleName,
+						provider: agent.model.provider,
+						model: agent.model.id,
+						text: finalText,
+					});
+				}
+				this.callbacks.onAgentTurnEnd?.(getAgentInfo(agent), finalText);
+
+				if (kind === "final") {
+					break;
+				}
+			}
+		} finally {
+			this.running = false;
+			this.callbacks.onRoomIdle?.();
+		}
+	}
+}

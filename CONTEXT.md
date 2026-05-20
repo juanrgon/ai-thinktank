@@ -86,6 +86,10 @@ Agent-visible work produced during a Thinktank Session that is not yet an intent
 
 The human-facing view of a Thinktank Session as a live interleaved conversation. A Room View emphasizes the shared room experience while allowing secondary filtering by Lab Agent or event type when needed.
 
+### Compact Roster Indicator
+
+The footer-level Room View summary of the active Agent Roster. A Compact Roster Indicator shows abbreviated Lab Agent model identities when space allows and truncates cleanly on narrow terminals. Full provider and model details belong in the Roster Selector.
+
 ### Tool Posture
 
 The practical working character of the product. The first CLI prototype should feel like a serious coding agent or engineering assistant rather than a theatrical conversation simulator or research salon. An existing coding-agent experience is a desirable host when it can preserve the Thinktank Session vision; a standalone CLI is preferable when hosting would compromise that vision.
@@ -101,6 +105,54 @@ The person who starts, observes, and steers a Thinktank Session. A Human Partici
 ### Natural-Language Control
 
 The way a Human Participant steers a Thinktank Session by speaking plainly rather than using a dedicated command syntax or special control phrases. Natural-Language Control preserves the same-room experience by treating human steering as conversational participation in the room. Any Lab Agent may respond to or incorporate a Human Participant's contribution.
+
+### Pi Control Command
+
+A Pi-compatible slash command that changes local room or session configuration without becoming part of the Lab Agents' natural conversation. Pi Control Commands are appropriate for control-plane operations such as choosing Lab Agent models, resuming sessions, toggling views, or changing local settings. Pi Control Commands should not replace Natural-Language Control for the substantive work goal or ordinary steering of the Thinktank Session.
+
+### Roster Command
+
+The Pi Control Command `/roster`, used to view and change the Agent Roster for a Thinktank Session. The Roster Command controls which Lab Agents participate and which configured Pi models power them. It updates room configuration and Model Provenance rather than becoming a Lab Agent conversational turn.
+
+### Roster Selector
+
+The Pi-style terminal selector opened by the Roster Command. A Roster Selector shows the current Lab Agent slots and their Model Provenance, then lets the Human Participant choose configured Pi models for those slots using familiar Pi selector behavior rather than a new command language. The first Roster Selector is scoped to the Core Lab Roster: OpenAI, Google, and Anthropic.
+
+### Lab Slot Provider Filtering
+
+The Roster Selector rule that each Core Lab Roster slot offers configured Pi models from that lab's provider family by default. The OpenAI slot offers OpenAI-compatible providers, the Google slot offers Google-compatible providers, and the Anthropic slot offers Anthropic-compatible providers. Cross-family providers such as GitHub Copilot may appear in multiple slots when the concrete model identity clearly belongs to that lab family, for example `github-copilot/gpt-*`, `github-copilot/gemini-*`, or `github-copilot/claude-*`. Lab Slot Provider Filtering preserves Model Provenance. A later advanced custom-agent path may allow intentionally breaking the lab-to-provider mapping.
+
+### Roster Change Window
+
+The point in a Thinktank Session when Roster Configuration may be changed. In the first implementation, the Roster Command may show the current Agent Roster while the room is working, but Roster Configuration changes are only committed while the Room Runtime is idle between turns. This avoids changing a Lab Agent's model identity mid-turn.
+
+### Public Configuration Event
+
+A room-visible Session Transcript entry for a Room Runtime configuration change. A Public Configuration Event is not a Lab Agent conversational turn. Roster Configuration changes are recorded as Public Configuration Events so future turns and resumed sessions have accurate Model Provenance.
+
+### Roster Configuration
+
+The session-scoped record of which Lab Agents participate in a Thinktank Session and which configured Pi models power them. Roster Configuration is part of Session State and should restore when a Thinktank Session is resumed. A later Pi-style settings action may save a Roster Configuration as the default for new sessions.
+
+### Room Runtime
+
+The coordinating runtime for a Thinktank Session. A Room Runtime owns the public Session Transcript, Agent Roster, Natural Turn Taking, Roster Configuration, Driver Handoffs, and coordination around Public Actions. It does not replace Lab Agent runtimes; it coordinates them.
+
+### Lab Agent Runtime
+
+A Pi-derived agent runtime owned by one Lab Agent in a Thinktank Session. Each Lab Agent Runtime has its own model identity, system prompt, message context, tool stream, and session branch. Lab Agent Runtimes are coordinated by the Room Runtime so their conversation and Tool-Mediated Work remain public to the room.
+
+### Action Mediation
+
+The Room Runtime's responsibility for observing and coordinating Tool-Mediated Work initiated by Lab Agent Runtimes. Lab Agent Runtimes initiate ordinary tool calls through Pi-derived tool streams. The Room Runtime records those Public Actions in the Session Transcript and makes them visible to the room. Observational work may proceed through the Lab Agent Runtime, while edits and writes are gated by the Room Runtime through Pre-Edit Deliberation and Coordinated Write rules.
+
+### Public Context Injection
+
+The way the Room Runtime shares room state with a Lab Agent Runtime before that Lab Agent takes a turn. Public Context Injection gives the Lab Agent Runtime the current Session Brief, relevant public transcript excerpts, Agent Roster and Model Provenance, and Action Summaries. Public Context Injection keeps Lab Agent Runtimes distinct while ensuring that public conversation and Tool-Mediated Work are visible to every Lab Agent.
+
+### Room-First Input Routing
+
+The input routing rule that every Human Participant message enters the Room Runtime before reaching any Lab Agent Runtime. The Room Runtime records human turns in the public Session Transcript, distinguishes Pi Control Commands from substantive room messages, and then injects substantive messages into the relevant Lab Agent Runtimes through Public Context Injection.
 
 ### Single Conversation Flow
 

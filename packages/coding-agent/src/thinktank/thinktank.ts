@@ -14,28 +14,55 @@ import {
 	streamSimple,
 } from "@earendil-works/pi-ai";
 import chalk from "chalk";
-import { getAgentDir, VERSION } from "../config.ts";
+import { getAgentDir } from "../config.ts";
 import { AuthStorage } from "../core/auth-storage.ts";
 import { ModelRegistry } from "../core/model-registry.ts";
-import { defaultModelPerProvider } from "../core/model-resolver.ts";
+import {
+	getThinktankVisibleName,
+	type LabId,
+	selectThinktankRosterEntry,
+	THINKTANK_LAB_DEFINITIONS,
+	type ThinktankAgentModelSelection,
+	type ThinktankAgentRosterSelection,
+	type ThinktankAgentRosterSelections,
+	type ThinktankLabDefinition,
+} from "./roster.ts";
 
-type LabId = "openai" | "google" | "anthropic";
-
-interface LabDefinition {
-	id: LabId;
-	displayName: string;
-	shortName: string;
-	providerCandidates: string[];
-	preferredModelIds: string[];
-	displayModelIds: string[];
-	modelIdNeedles: string[];
-}
+export {
+	type LabId,
+	THINKTANK_LAB_IDS,
+	type ThinktankAgentModelSelection,
+	type ThinktankAgentModelSelections,
+	type ThinktankAgentRosterSelection,
+	type ThinktankAgentRosterSelections,
+	type ThinktankAvailableModel,
+} from "./roster.ts";
 
 interface LabAgent {
-	definition: LabDefinition;
+	definition: ThinktankLabDefinition;
 	model: Model<Api>;
+	thinkingLevel: ModelThinkingLevel;
 	visibleName: string;
 }
+
+export interface AgentInfo {
+	visibleName: string;
+	lab: string;
+	labId: LabId;
+	provider: string;
+	model: string;
+	thinkingLevel: string;
+}
+
+export interface ThinktankRosterPreview {
+	agents: AgentInfo[];
+	missingLabs: string[];
+	errors: string[];
+}
+
+export type ResolveAgentModelSelectionResult =
+	| { ok: true; selection: ThinktankAgentModelSelection; agent: AgentInfo }
+	| { ok: false; error: string };
 
 type TurnImpulseKind = "add" | "challenge" | "clarify" | "synthesize" | "final" | "none";
 
@@ -62,42 +89,32 @@ interface ThinktankSessionPaths {
 	briefPath: string;
 }
 
-interface RunOptions {
+export interface ThinktankSessionStartInfo {
+	cwd: string;
+	sessionDir: string;
+	agents: AgentInfo[];
+	missingLabs: string[];
+}
+
+export interface ThinktankRenderer {
+	onSessionStart?(info: ThinktankSessionStartInfo): void;
+	onUserPrompt?(prompt: string): void;
+	onAgentStart?(agent: AgentInfo): void;
+	onAgentDelta?(agent: AgentInfo, delta: string): void;
+	onAgentEnd?(agent: AgentInfo, text: string): void;
+	onStatus?(message: string): void;
+	onError?(message: string): void;
+}
+
+export interface RunOptions {
 	prompt: string;
 	cwd: string;
+	agentModelSelections?: ThinktankAgentRosterSelections;
 }
 
 const MAX_DYNAMIC_DISCUSSION_TURNS = 8;
 
-const LAB_DEFINITIONS: LabDefinition[] = [
-	{
-		id: "openai",
-		displayName: "GPT-5.5",
-		shortName: "OpenAI",
-		providerCandidates: ["openai-codex", "openai", "azure-openai-responses"],
-		preferredModelIds: [defaultModelPerProvider["openai-codex"], "gpt-5.5", defaultModelPerProvider.openai],
-		displayModelIds: [defaultModelPerProvider["openai-codex"], "gpt-5.5"],
-		modelIdNeedles: ["gpt-5.5", "gpt-5", "gpt"],
-	},
-	{
-		id: "google",
-		displayName: "Gemini 3.1 Pro",
-		shortName: "Google",
-		providerCandidates: ["google", "google-vertex"],
-		preferredModelIds: [defaultModelPerProvider.google, defaultModelPerProvider["google-vertex"]],
-		displayModelIds: [defaultModelPerProvider.google, defaultModelPerProvider["google-vertex"]],
-		modelIdNeedles: ["gemini-3.1-pro", "gemini-3", "gemini"],
-	},
-	{
-		id: "anthropic",
-		displayName: "Opus 4.7",
-		shortName: "Anthropic",
-		providerCandidates: ["anthropic"],
-		preferredModelIds: [defaultModelPerProvider.anthropic, "claude-opus-4-7"],
-		displayModelIds: [defaultModelPerProvider.anthropic, "claude-opus-4-7"],
-		modelIdNeedles: ["opus-4-7", "opus"],
-	},
-];
+const LAB_DEFINITIONS = THINKTANK_LAB_DEFINITIONS;
 
 const THINKTANK_SYSTEM_PROMPT = `You are a Lab Agent in an AI Thinktank CLI.
 
@@ -127,16 +144,17 @@ Return exactly one JSON object and no prose:
 
 Urgency is an integer from 0 to 100.`;
 
-function printHelp(): void {
+export function printThinktankHelp(): void {
 	console.log(`${chalk.bold("thinktank")} - multi-lab CLI agent room
 
 ${chalk.bold("Usage:")}
+  thinktank
   thinktank [prompt...]
   thinktank @prompt.md "additional instructions"
 
 ${chalk.bold("Behavior:")}
   Selects configured OpenAI, Google, and Anthropic models from Pi's local provider/auth setup.
-  Prints one continuous terminal transcript with natural agent-to-agent discussion.
+  Opens a Pi-style terminal room with natural agent-to-agent discussion.
   Stores durable session state under ~/.ai-thinktank/sessions.
 
 ${chalk.bold("Options:")}
@@ -144,7 +162,7 @@ ${chalk.bold("Options:")}
   --version, -v  Show version number`);
 }
 
-function readPipedStdin(): Promise<string | undefined> {
+export function readPipedStdin(): Promise<string | undefined> {
 	if (process.stdin.isTTY) {
 		return Promise.resolve(undefined);
 	}
@@ -163,7 +181,7 @@ function readPipedStdin(): Promise<string | undefined> {
 	});
 }
 
-function parseCliArgs(args: string[]): { help: boolean; version: boolean; promptParts: string[] } {
+export function parseThinktankCliArgs(args: string[]): { help: boolean; version: boolean; promptParts: string[] } {
 	const promptParts: string[] = [];
 	let help = false;
 	let version = false;
@@ -238,6 +256,54 @@ function isReasoningLevel(level: ModelThinkingLevel): level is Exclude<ModelThin
 	return level !== "off";
 }
 
+function toAgentInfo(agent: LabAgent): AgentInfo {
+	return {
+		visibleName: agent.visibleName,
+		lab: agent.definition.shortName,
+		labId: agent.definition.id,
+		provider: agent.model.provider,
+		model: agent.model.id,
+		thinkingLevel: agent.thinkingLevel,
+	};
+}
+
+function createStdoutRenderer(cwd: string): ThinktankRenderer {
+	return {
+		onSessionStart(info) {
+			console.log(chalk.bold(`ai-thinktank  ${cwd}`));
+			console.log(
+				`agents: ${info.agents
+					.map((agent) => `${agent.visibleName} (${agent.provider}/${agent.model}:${agent.thinkingLevel})`)
+					.join(" | ")}`,
+			);
+			if (info.missingLabs.length > 0) {
+				console.log(chalk.dim(`missing: ${info.missingLabs.join(", ")} not configured`));
+			}
+			console.log(chalk.dim(`session: ${info.sessionDir}`));
+		},
+		onUserPrompt(prompt) {
+			console.log(`\n${chalk.bold("You:")}\n${prompt}`);
+		},
+		onAgentStart(agent) {
+			process.stdout.write(`\n${chalk.bold(agent.visibleName)}:\n`);
+		},
+		onAgentDelta(_agent, delta) {
+			process.stdout.write(delta);
+		},
+		onAgentEnd(_agent, text) {
+			if (!text.endsWith("\n")) {
+				process.stdout.write("\n");
+			}
+		},
+		onStatus(message) {
+			console.log(chalk.dim(message));
+		},
+		onError(message) {
+			console.error(chalk.red(message));
+		},
+	};
+}
+
 async function getRequestAuth(
 	modelRegistry: ModelRegistry,
 	model: Model<Api>,
@@ -259,11 +325,13 @@ async function streamLabResponse(options: {
 	prompt: string;
 	turns: TranscriptTurn[];
 	paths: ThinktankSessionPaths;
+	renderer: ThinktankRenderer;
 }): Promise<string> {
-	const { agent, modelRegistry, messages, prompt, turns, paths } = options;
+	const { agent, modelRegistry, messages, prompt, turns, paths, renderer } = options;
 	const auth = await getRequestAuth(modelRegistry, agent.model);
+	const agentInfo = toAgentInfo(agent);
 
-	const thinkingLevel = clampThinkingLevel(agent.model, "high");
+	const thinkingLevel = agent.thinkingLevel;
 	const context: Context = {
 		systemPrompt: `${THINKTANK_SYSTEM_PROMPT}
 
@@ -280,7 +348,7 @@ Use your model provenance as useful context, but do not over-explain it.`,
 		],
 	};
 
-	process.stdout.write(`\n${chalk.bold(agent.visibleName)}:\n`);
+	renderer.onAgentStart?.(agentInfo);
 	const stream = streamSimple(agent.model, context, {
 		apiKey: auth.apiKey,
 		headers: auth.headers,
@@ -290,16 +358,14 @@ Use your model provenance as useful context, but do not over-explain it.`,
 	let streamedText = "";
 	for await (const event of stream) {
 		if (event.type === "text_delta") {
-			process.stdout.write(event.delta);
+			renderer.onAgentDelta?.(agentInfo, event.delta);
 			streamedText += event.delta;
 		}
 	}
 
 	const result = await stream.result();
 	const finalText = streamedText.trim() || getTextFromAssistantMessage(result);
-	if (!streamedText.endsWith("\n")) {
-		process.stdout.write("\n");
-	}
+	renderer.onAgentEnd?.(agentInfo, finalText);
 
 	if (result.stopReason === "error" || result.stopReason === "aborted") {
 		throw new Error(result.errorMessage || `${agent.visibleName} request ${result.stopReason}`);
@@ -355,67 +421,29 @@ function transcriptText(turns: TranscriptTurn[]): string {
 	return turns.map((turn) => `${turn.speaker}:\n${turn.text}`).join("\n\n");
 }
 
-function selectExactModel(availableModels: Model<Api>[], provider: string, modelIds: string[]): Model<Api> | undefined {
-	for (const modelId of modelIds) {
-		const match = availableModels.find((model) => model.provider === provider && model.id === modelId);
-		if (match) {
-			return match;
-		}
-	}
-	return undefined;
-}
-
-function selectFuzzyModel(
+function selectLabAgent(
+	definition: ThinktankLabDefinition,
 	availableModels: Model<Api>[],
-	provider: string,
-	modelIdNeedles: string[],
-): Model<Api> | undefined {
-	const providerModels = availableModels.filter((model) => model.provider === provider);
-	for (const needle of modelIdNeedles) {
-		const lowerNeedle = needle.toLowerCase();
-		const match = providerModels.find(
-			(model) => model.id.toLowerCase().includes(lowerNeedle) || model.name?.toLowerCase().includes(lowerNeedle),
-		);
-		if (match) {
-			return match;
-		}
+	selection?: ThinktankAgentRosterSelection,
+): LabAgent | undefined {
+	const entry = selectThinktankRosterEntry(availableModels, definition, selection);
+	if (!entry) {
+		return undefined;
 	}
-	return providerModels[0];
+	const { model, thinkingLevel } = entry;
+	return { definition, model, thinkingLevel, visibleName: getThinktankVisibleName(definition, model) };
 }
 
-function getVisibleName(definition: LabDefinition, model: Model<Api>): string {
-	const modelLabel = model.name ?? model.id;
-	if (definition.displayModelIds.includes(model.id)) {
-		return definition.displayName;
-	}
-	return `${definition.shortName} (${modelLabel})`;
-}
-
-function selectLabAgent(definition: LabDefinition, availableModels: Model<Api>[]): LabAgent | undefined {
-	for (const provider of definition.providerCandidates) {
-		const exact = selectExactModel(availableModels, provider, definition.preferredModelIds);
-		if (exact) {
-			return { definition, model: exact, visibleName: getVisibleName(definition, exact) };
-		}
-	}
-
-	for (const provider of definition.providerCandidates) {
-		const fuzzy = selectFuzzyModel(availableModels, provider, definition.modelIdNeedles);
-		if (fuzzy) {
-			return { definition, model: fuzzy, visibleName: getVisibleName(definition, fuzzy) };
-		}
-	}
-
-	return undefined;
-}
-
-function selectRoster(modelRegistry: ModelRegistry): { agents: LabAgent[]; missingLabs: LabDefinition[] } {
+function selectRoster(
+	modelRegistry: ModelRegistry,
+	selections: ThinktankAgentRosterSelections = {},
+): { agents: LabAgent[]; missingLabs: ThinktankLabDefinition[] } {
 	const availableModels = modelRegistry.getAvailable();
 	const agents: LabAgent[] = [];
-	const missingLabs: LabDefinition[] = [];
+	const missingLabs: ThinktankLabDefinition[] = [];
 
 	for (const definition of LAB_DEFINITIONS) {
-		const agent = selectLabAgent(definition, availableModels);
+		const agent = selectLabAgent(definition, availableModels, selections[definition.id]);
 		if (agent) {
 			agents.push(agent);
 		} else {
@@ -424,10 +452,6 @@ function selectRoster(modelRegistry: ModelRegistry): { agents: LabAgent[]; missi
 	}
 
 	return { agents, missingLabs };
-}
-
-function formatModelReference(agent: LabAgent): string {
-	return `${agent.visibleName} (${agent.model.provider}/${agent.model.id})`;
 }
 
 function parseTurnImpulse(text: string): TurnImpulse | undefined {
@@ -581,12 +605,24 @@ async function chooseNextTurn(options: {
 	return { action: "speak", agent: strongest.agent, kind: strongest.impulse.kind };
 }
 
-function buildInitialPrompt(userPrompt: string): string {
-	return `The human participant asked:
+function buildInitialPrompt(userPrompt: string, turns: TranscriptTurn[]): string {
+	if (turns.length === 0) {
+		return `The human participant asked:
 
 ${userPrompt}
 
 Give your first contribution to the room. Answer directly, surface the most important considerations, and leave openings for the other Lab Agents to build on or challenge.`;
+	}
+
+	return `The human participant asked:
+
+${userPrompt}
+
+The room transcript so far:
+
+${transcriptText(turns)}
+
+Give your first contribution to the room. Build on anything useful that has already been said, challenge weak points if needed, and leave openings for the other Lab Agents.`;
 }
 
 function buildDiscussionPrompt(userPrompt: string, turns: TranscriptTurn[]): string {
@@ -613,15 +649,18 @@ ${transcriptText(turns)}
 State the room's current answer in a concise final contribution. Preserve important uncertainty and scenarios where useful.`;
 }
 
-async function runThinktank(options: RunOptions): Promise<number> {
+export async function runThinktank(
+	options: RunOptions,
+	renderer: ThinktankRenderer = createStdoutRenderer(options.cwd),
+): Promise<number> {
 	const authStorage = AuthStorage.create(join(getAgentDir(), "auth.json"));
 	const modelRegistry = ModelRegistry.create(authStorage, join(getAgentDir(), "models.json"));
-	const { agents, missingLabs } = selectRoster(modelRegistry);
+	const { agents, missingLabs } = selectRoster(modelRegistry, options.agentModelSelections);
 
 	if (agents.length === 0) {
-		console.error(chalk.red("No configured OpenAI, Google, or Anthropic models found in Pi's local auth setup."));
-		console.error(chalk.dim(`Pi agent directory: ${getAgentDir()}`));
-		console.error(chalk.dim("Use pi login/configuration first, then run thinktank again."));
+		renderer.onError?.("No configured OpenAI, Google, or Anthropic models found in Pi's local auth setup.");
+		renderer.onStatus?.(`Pi agent directory: ${getAgentDir()}`);
+		renderer.onStatus?.("Use pi login/configuration first, then run thinktank again.");
 		return 1;
 	}
 
@@ -629,13 +668,13 @@ async function runThinktank(options: RunOptions): Promise<number> {
 	const turns: TranscriptTurn[] = [];
 	const messages: Message[] = [];
 
-	console.log(chalk.bold(`ai-thinktank  ${options.cwd}`));
-	console.log(`agents: ${agents.map(formatModelReference).join(" · ")}`);
-	if (missingLabs.length > 0) {
-		console.log(chalk.dim(`missing: ${missingLabs.map((lab) => lab.shortName).join(", ")} not configured`));
-	}
-	console.log(chalk.dim(`session: ${paths.dir}`));
-	console.log(`\n${chalk.bold("You:")}\n${options.prompt}`);
+	renderer.onSessionStart?.({
+		cwd: options.cwd,
+		sessionDir: paths.dir,
+		agents: agents.map(toAgentInfo),
+		missingLabs: missingLabs.map((lab) => lab.shortName),
+	});
+	renderer.onUserPrompt?.(options.prompt);
 
 	appendTranscript(paths, {
 		type: "session_start",
@@ -647,23 +686,27 @@ async function runThinktank(options: RunOptions): Promise<number> {
 			lab: agent.definition.shortName,
 			provider: agent.model.provider,
 			model: agent.model.id,
+			thinkingLevel: agent.thinkingLevel,
 		})),
 	});
 
+	renderer.onStatus?.("Opening the room.");
 	for (const agent of agents) {
 		await streamLabResponse({
 			agent,
 			modelRegistry,
 			messages,
-			prompt: buildInitialPrompt(options.prompt),
+			prompt: buildInitialPrompt(options.prompt, turns),
 			turns,
 			paths,
+			renderer,
 		});
 		writeBrief(paths, turns, options);
 	}
 
 	let finalAgent = agents[0];
 	for (let dynamicTurnsCompleted = 0; dynamicTurnsCompleted < MAX_DYNAMIC_DISCUSSION_TURNS; dynamicTurnsCompleted++) {
+		renderer.onStatus?.("Listening for who wants the floor.");
 		const next = await chooseNextTurn({
 			agents,
 			modelRegistry,
@@ -686,6 +729,7 @@ async function runThinktank(options: RunOptions): Promise<number> {
 					: buildDiscussionPrompt(options.prompt, turns),
 			turns,
 			paths,
+			renderer,
 		});
 		writeBrief(paths, turns, options);
 		finalAgent = next.agent;
@@ -701,35 +745,9 @@ async function runThinktank(options: RunOptions): Promise<number> {
 		prompt: buildClosingPrompt(options.prompt, turns),
 		turns,
 		paths,
+		renderer,
 	});
 	writeBrief(paths, turns, options);
 
 	return 0;
-}
-
-export async function runThinktankCli(args: string[]): Promise<number> {
-	const parsed = parseCliArgs(args);
-	if (parsed.help) {
-		printHelp();
-		return 0;
-	}
-	if (parsed.version) {
-		console.log(VERSION);
-		return 0;
-	}
-
-	const stdinPrompt = await readPipedStdin();
-	const prompt = [...parsed.promptParts, stdinPrompt]
-		.filter((part): part is string => !!part)
-		.join("\n\n")
-		.trim();
-	if (!prompt) {
-		printHelp();
-		return 1;
-	}
-
-	return runThinktank({
-		prompt,
-		cwd: process.cwd(),
-	});
 }

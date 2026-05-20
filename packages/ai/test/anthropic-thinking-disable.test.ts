@@ -145,6 +145,13 @@ describe("Anthropic thinking disable payload", () => {
 		expect(payload.thinking).toEqual({ type: "adaptive", display: "summarized" });
 		expect(payload.output_config).toEqual({ effort: "xhigh" });
 	});
+
+	it("clamps Copilot Claude Opus 4.7 reasoning to medium", async () => {
+		const payload = await capturePayload(getModel("github-copilot", "claude-opus-4.7"), { reasoning: "high" });
+
+		expect(payload.thinking).toEqual({ type: "adaptive", display: "summarized" });
+		expect(payload.output_config).toEqual({ effort: "medium" });
+	});
 });
 
 describe.skipIf(!process.env.ANTHROPIC_API_KEY)("Anthropic thinking disable E2E", () => {
