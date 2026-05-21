@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
 # Colors
 RED='\033[0;31m'
@@ -24,29 +24,24 @@ if ! command -v pi &> /dev/null; then
     exit 1
 fi
 
+# Target reference (branch or tag) to install from, defaulting to main
+AI_THINKTANK_REF="${AI_THINKTANK_REF:-main}"
+
 # 3. Setup install directory
 INSTALL_DIR="$HOME/.ai-thinktank/ai-thinktank"
 
 if [ -d "$INSTALL_DIR" ]; then
     echo -e "${BLUE}Updating existing repository at $INSTALL_DIR...${NC}"
     cd "$INSTALL_DIR"
-    git fetch origin
-    # If the user is testing the feature branch script, we use that branch. Otherwise main.
-    BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null || echo "main")
-    if [ "$BRANCH" = "feature/agent-interrupts" ]; then
-        git reset --hard origin/feature/agent-interrupts
-    else
-        git reset --hard origin/main
-    fi
+    git fetch origin "$AI_THINKTANK_REF"
+    git checkout "$AI_THINKTANK_REF"
+    git reset --hard "origin/$AI_THINKTANK_REF"
 else
     echo -e "${BLUE}Cloning repository to $INSTALL_DIR...${NC}"
     mkdir -p "$HOME/.ai-thinktank"
     git clone https://github.com/juanrgon/ai-thinktank.git "$INSTALL_DIR"
     cd "$INSTALL_DIR"
-    # Try to checkout the feature branch if it exists remotely, otherwise stick to main
-    if git ls-remote --exit-code --heads origin feature/agent-interrupts >/dev/null 2>&1; then
-        git checkout feature/agent-interrupts
-    fi
+    git checkout "$AI_THINKTANK_REF"
 fi
 
 # 4. Install the extension using pi
