@@ -2,6 +2,10 @@
 
 AI Thinktank is a hard fork of Pi Coding Agent, reshaped around multiple lab agents working together in one serious terminal transcript.
 
+## Thinktank Room Extension
+
+The main feature is the Thinktank Room extension. See [its documentation](packages/coding-agent/examples/extensions/thinktank-room/README.md) for how to install it on your computer.
+
 The first fork-specific entrypoint is `thinktank`:
 
 ```bash
