@@ -7,10 +7,10 @@ AI Thinktank is a hard fork of Pi Coding Agent, reshaped around multiple lab age
 The main feature is the Thinktank Room extension. You can install it on any machine using this one-liner:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/juanrgon/ai-thinktank/feature/agent-interrupts/scripts/install-thinktank-room.sh | AI_THINKTANK_REF=feature/agent-interrupts bash
+pi install git:github.com/juanrgon/pi-thinktank
 ```
 
-See [its documentation](packages/coding-agent/examples/extensions/thinktank-room/README.md) for more details.
+See [its repository](https://github.com/juanrgon/pi-thinktank) for more details.
 
 The first fork-specific entrypoint is `thinktank`:
 
