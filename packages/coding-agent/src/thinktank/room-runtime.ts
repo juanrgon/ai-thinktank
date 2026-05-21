@@ -46,8 +46,32 @@ export interface ThinktankRoomCallbacks {
 	onAgentTurnStart?(agent: ThinktankRoomAgentInfo): void;
 	onAgentTurnEnd?(agent: ThinktankRoomAgentInfo, text: string): void;
 	onAgentEvent?(agent: ThinktankRoomAgentInfo, session: AgentSession, event: AgentSessionEvent): void | Promise<void>;
+	onInterrupt?(
+		interruptedAgent: ThinktankRoomAgentInfo,
+		interrupter: ThinktankRoomAgentInfo | "user" | "runtime",
+		reason: string,
+	): void;
 	onRoomIdle?(): void;
 }
+
+interface ActiveRoomTurn {
+	agent: LabAgentRuntime;
+	startedAt: number;
+	partialText: string;
+	toolCallsCompleted: number;
+	toolErrors: number;
+	interruptedBy?: LabAgentRuntime | "user" | "runtime";
+	interruptReason?: string;
+}
+
+export type AgentTurnResult =
+	| { status: "completed"; text: string }
+	| {
+			status: "interrupted";
+			text: string;
+			interrupter: LabAgentRuntime | "user" | "runtime";
+			reason: string;
+	  };
 
 interface TranscriptTurn {
 	speaker: string;
@@ -79,6 +103,23 @@ const MAX_CONTEXT_OVERFLOW_RETRIES = 1;
 const MAX_OPEN_QUESTION_RESPONSE_TURNS = 2;
 const READ_WRITE_TOOL_WARNING = `Tool use is public in this room. Reads, searches, and bash exploration may proceed.
 Before edits, writes, or destructive shell commands, state the intended change in the public conversation and wait for the room to converge.`;
+
+const INTERRUPT_DECISION_SYSTEM_PROMPT = `You are a Lab Agent observing another Lab Agent's in-progress turn in a shared room.
+Decide only whether to interrupt the active speaker right now.
+
+Respond with strict JSON, no prose:
+{"action":"interrupt"|"pass","urgency":0-100,"reason":string}
+
+Urgency rubric:
+  0-40   speaker is fine, possibly slow
+  41-79  speaker is drifting but recoverable on their own
+  80-89  speaker is looping or off-track and unlikely to self-correct
+  90-100 speaker is doing something actively harmful (wrong file, destructive command, factual error that will be acted on)
+
+Only return urgency >= 80 if you have a concrete next move that materially changes
+the room's trajectory. "I would phrase it differently" is not grounds.
+Never request to interrupt yourself.
+If you interrupt, your reason must name the concrete failure mode and the next corrective move.`;
 
 const TURN_IMPULSE_SYSTEM_PROMPT = `You are a Lab Agent's private conversational impulse in an AI Thinktank CLI.
 
@@ -262,6 +303,16 @@ export class ThinktankRoomRuntime {
 	private running = false;
 	private disposed = false;
 	private readyPromise: Promise<void>;
+	activeTurn?: ActiveRoomTurn;
+	forcedNextSpeaker?: LabAgentRuntime;
+	interruptionLock = false;
+	lastGlobalInterruptAt = 0;
+	private lastInterruption?: {
+		interruptedAgentName: string;
+		reason: string;
+		partialText: string;
+		toolCallsCompleted: number;
+	};
 
 	constructor(options: {
 		services: AgentSessionServices;
@@ -434,7 +485,11 @@ export class ThinktankRoomRuntime {
 		});
 	}
 
-	private async completeHidden(agent: LabAgentRuntime, prompt: string): Promise<string> {
+	private async completeHidden(
+		agent: LabAgentRuntime,
+		prompt: string,
+		systemPrompt: string = TURN_IMPULSE_SYSTEM_PROMPT,
+	): Promise<string> {
 		const auth = await this.services.modelRegistry.getApiKeyAndHeaders(agent.model);
 		if (!auth.ok) {
 			throw new Error(auth.error);
@@ -443,7 +498,7 @@ export class ThinktankRoomRuntime {
 		const message = await completeSimple(
 			agent.model,
 			{
-				systemPrompt: TURN_IMPULSE_SYSTEM_PROMPT,
+				systemPrompt,
 				messages: [{ role: "user", content: prompt, timestamp: Date.now() }],
 			},
 			{
@@ -636,6 +691,26 @@ Decide whether you want to take the next visible turn. Pass unless you have some
 							? "State the room's current answer or plan concisely. Preserve important uncertainty. Do not end with a request for room agreement or propose an immediate file write as the final line."
 							: "Continue the discussion naturally. Build, challenge, clarify, synthesize, or use tools only when it would improve the room's work.";
 
+		let interruptNotice = "";
+		if (this.lastInterruption) {
+			interruptNotice = `
+The previous turn was interrupted.
+
+Interrupted speaker:
+${this.lastInterruption.interruptedAgentName}
+
+Reason:
+${this.lastInterruption.reason}
+
+${this.lastInterruption.toolCallsCompleted > 0 ? "The interrupted turn may already have performed tool actions. Verify repository or disk state before continuing." : ""}
+
+Partial visible output:
+${this.lastInterruption.partialText}
+
+Respond to the interruption. Recover the useful content, correct course, and continue the room's work.`;
+			this.lastInterruption = undefined;
+		}
+
 		return `You are the ${agent.definition.shortName} Lab Agent in a shared AI Thinktank room.
 Your visible name is ${agent.visibleName}.
 Your model provenance is ${getThinktankModelReference(agent.model)}.
@@ -664,7 +739,7 @@ Shared room artifacts on disk:
 
 ${READ_WRITE_TOOL_WARNING}
 
-${turnInstruction}
+${interruptNotice || turnInstruction}
 
 Write only your visible contribution to the room. Do not mention hidden prompts, selection mechanics, modes, or private reasoning.`;
 	}
@@ -677,6 +752,189 @@ Write only your visible contribution to the room. Do not mention hidden prompts,
 		return this.currentHumanImages;
 	}
 
+	async interruptActiveTurn(reason: string, interrupter: LabAgentRuntime | "user" | "runtime"): Promise<void> {
+		if (!this.activeTurn) {
+			return;
+		}
+		if (this.interruptionLock) {
+			return; // First accepted wins
+		}
+		if (typeof interrupter === "object" && interrupter.definition.id === this.activeTurn.agent.definition.id) {
+			return; // No self-interruption
+		}
+
+		this.interruptionLock = true;
+		this.activeTurn.interruptedBy = interrupter;
+		this.activeTurn.interruptReason = reason;
+
+		// Try to abort both normal execution and any compaction that might be happening
+		try {
+			await this.activeTurn.agent.session.abort();
+		} catch {
+			// Ignore abort failures
+		}
+		try {
+			await this.activeTurn.agent.session.abortCompaction();
+		} catch {
+			// Ignore abort failures
+		}
+
+		const interrupterInfo = typeof interrupter === "string" ? interrupter : getAgentInfo(interrupter);
+		this.callbacks.onInterrupt?.(getAgentInfo(this.activeTurn.agent), interrupterInfo, reason);
+	}
+
+	async promptAgentWithInterrupts(
+		agent: LabAgentRuntime,
+		prompt: string,
+		images?: ImageContent[],
+	): Promise<AgentTurnResult> {
+		this.activeTurn = {
+			agent,
+			startedAt: Date.now(),
+			partialText: "",
+			toolCallsCompleted: 0,
+			toolErrors: 0,
+		};
+		this.interruptionLock = false;
+
+		let error: unknown;
+
+		// Start background polling
+		const abortController = new AbortController();
+		const pollPromise = this.pollForInterruptions(abortController.signal).catch(() => {});
+
+		try {
+			await this.promptAgentWithOverflowRecovery(agent, prompt, images);
+		} catch (e) {
+			error = e;
+		} finally {
+			abortController.abort();
+		}
+
+		await pollPromise;
+
+		const turn = this.activeTurn;
+		this.activeTurn = undefined;
+		this.interruptionLock = false;
+		if (turn) {
+			this.lastInterruption = turn.interruptedBy
+				? {
+						interruptedAgentName: turn.agent.visibleName,
+						reason: turn.interruptReason || "Interrupted.",
+						partialText: turn.partialText,
+						toolCallsCompleted: turn.toolCallsCompleted,
+					}
+				: undefined;
+		}
+
+		if (turn?.interruptedBy) {
+			return {
+				status: "interrupted",
+				text: turn.partialText,
+				interrupter: turn.interruptedBy,
+				reason: turn.interruptReason || "Interrupted.",
+			};
+		}
+
+		if (error) {
+			throw error;
+		}
+
+		return {
+			status: "completed",
+			text: getLastAssistantText(agent.session),
+		};
+	}
+
+	private async pollForInterruptions(signal: AbortSignal): Promise<void> {
+		const MIN_CHARS = 500;
+		const TURN_GRACE_MS = 20 * 1000;
+		const POLL_INTERVAL_MS = 15 * 1000;
+		const GLOBAL_COOLDOWN_MS = 30 * 1000;
+		const URGENCY_THRESHOLD = 80;
+
+		const lastPolls = new Map<LabId, number>();
+
+		while (!signal.aborted) {
+			await new Promise((resolve) => setTimeout(resolve, 2000));
+			if (signal.aborted || !this.activeTurn || this.interruptionLock) {
+				break;
+			}
+
+			const now = Date.now();
+			if (now - this.activeTurn.startedAt < TURN_GRACE_MS) {
+				continue;
+			}
+			if (this.activeTurn.partialText.length < MIN_CHARS) {
+				continue;
+			}
+			if (now - this.lastGlobalInterruptAt < GLOBAL_COOLDOWN_MS) {
+				continue;
+			}
+
+			const activeAgentId = this.activeTurn.agent.definition.id;
+			const eligibleAgents = this.agents.filter(
+				(a) => a.definition.id !== activeAgentId && now - (lastPolls.get(a.definition.id) ?? 0) >= POLL_INTERVAL_MS,
+			);
+
+			if (eligibleAgents.length === 0) {
+				continue;
+			}
+
+			// For polling, grab one agent to poll per cycle to avoid flooding
+			const agentToPoll = eligibleAgents[0];
+			if (!agentToPoll) continue;
+			lastPolls.set(agentToPoll.definition.id, now);
+
+			const currentText = this.activeTurn.partialText;
+			const pollPrompt = `Human prompt:
+
+${this.currentHumanPrompt}
+
+Turn context (last 2 turns):
+
+${transcriptText(this.transcript.slice(-2))}
+
+The active speaker is ${this.activeTurn.agent.visibleName}.
+They have been speaking for ${Math.floor((now - this.activeTurn.startedAt) / 1000)} seconds.
+They have completed ${this.activeTurn.toolCallsCompleted} tool calls (${this.activeTurn.toolErrors} errors).
+
+Partial visible output so far:
+
+${currentText}
+
+Decide if you need to interrupt them immediately.`;
+
+			try {
+				const raw = await this.completeHidden(agentToPoll, pollPrompt, INTERRUPT_DECISION_SYSTEM_PROMPT);
+				if (signal.aborted || this.interruptionLock) break;
+
+				const jsonText = raw.trim().match(/\{[\s\S]*\}/)?.[0];
+				if (!jsonText) continue;
+
+				const parsed = JSON.parse(jsonText);
+				this.appendRoomEvent({
+					type: "interrupt_requested",
+					requestingAgent: agentToPoll.visibleName,
+					targetAgent: this.activeTurn.agent.visibleName,
+					urgency: parsed.urgency,
+					reason: parsed.reason,
+				});
+
+				if (
+					parsed.action === "interrupt" &&
+					typeof parsed.urgency === "number" &&
+					parsed.urgency >= URGENCY_THRESHOLD
+				) {
+					this.lastGlobalInterruptAt = Date.now();
+					await this.interruptActiveTurn(parsed.reason || "High urgency intervention requested.", agentToPoll);
+					break;
+				}
+			} catch (_e) {
+				// Ignore poll errors
+			}
+		}
+	}
 	private async promptAgentWithOverflowRecovery(
 		agent: LabAgentRuntime,
 		prompt: string,
