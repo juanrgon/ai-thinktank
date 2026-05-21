@@ -2,8 +2,8 @@ import { appendFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { Api, Model, TextContent } from "@earendil-works/pi-ai";
-import { clampThinkingLevel, completeSimple } from "@earendil-works/pi-ai";
+import type { Api, AssistantMessage, ImageContent, Model, TextContent } from "@earendil-works/pi-ai";
+import { clampThinkingLevel, completeSimple, isContextOverflow } from "@earendil-works/pi-ai";
 import type { AgentSession, AgentSessionEvent } from "../core/agent-session.ts";
 import type { AgentSessionServices } from "../core/agent-session-services.ts";
 import { createAgentSessionFromServices } from "../core/agent-session-services.ts";
@@ -75,6 +75,8 @@ interface LabAgentRuntime {
 const MAX_ROOM_TURNS = 10;
 const MIN_DYNAMIC_TURNS_AFTER_OPENING = 1;
 const MIN_URGENCY_TO_SPEAK = 18;
+const MAX_CONTEXT_OVERFLOW_RETRIES = 1;
+const MAX_OPEN_QUESTION_RESPONSE_TURNS = 2;
 const READ_WRITE_TOOL_WARNING = `Tool use is public in this room. Reads, searches, and bash exploration may proceed.
 Before edits, writes, or destructive shell commands, state the intended change in the public conversation and wait for the room to converge.`;
 
@@ -139,6 +141,29 @@ function getLastAssistantText(session: AgentSession): string {
 	return "";
 }
 
+function isContextOverflowException(error: unknown, model: Model<Api>): boolean {
+	const errorMessage = error instanceof Error ? error.message : String(error);
+	const message = {
+		role: "assistant",
+		content: [],
+		api: model.api,
+		provider: model.provider,
+		model: model.id,
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "error",
+		errorMessage,
+		timestamp: Date.now(),
+	} as AssistantMessage;
+	return isContextOverflow(message, model.contextWindow);
+}
+
 function transcriptText(turns: TranscriptTurn[]): string {
 	if (turns.length === 0) {
 		return "(No Lab Agent has spoken yet.)";
@@ -197,6 +222,31 @@ function parseTurnImpulse(text: string): TurnImpulse | undefined {
 	};
 }
 
+function turnNeedsRoomResponse(text: string): boolean {
+	const normalized = text.toLowerCase().replace(/\s+/g, " ").trim();
+	if (!normalized) {
+		return false;
+	}
+
+	const asksRoomForCoordination =
+		/\b(does|do|can|should|shall)\s+(the\s+)?room\s+(agree|want|prefer|approve|confirm)\b/.test(normalized) ||
+		/\b(room|everyone|we)\s+(agree|aligned|comfortable|ready)\b/.test(normalized) ||
+		/\b(any|no)\s+(objections|concerns)\b/.test(normalized) ||
+		/\b(can|should|shall)\s+i\s+(proceed|write|edit|create|make|apply)\b/.test(normalized);
+
+	const proposesImmediateWrite =
+		/\bintended action:\s*i\s+will\s+(write|edit|create|update|modify|apply)\b/.test(normalized) ||
+		/\bi\s+will\s+(write|edit|create|update|modify|apply)\s+.+\b(file|deck|document|patch|change)\b/.test(normalized);
+
+	const endsWithCoordinationQuestion =
+		/\?\s*$/.test(normalized) &&
+		/\b(agree|agreement|aligned|approval|approve|proceed|next step|filename|write|edit|create|room)\b/.test(
+			normalized,
+		);
+
+	return asksRoomForCoordination || endsWithCoordinationQuestion || proposesImmediateWrite;
+}
+
 export class ThinktankRoomRuntime {
 	private services: AgentSessionServices;
 	private cwd: string;
@@ -207,6 +257,8 @@ export class ThinktankRoomRuntime {
 	private transcript: TranscriptTurn[] = [];
 	private publicActions: PublicActionSummary[] = [];
 	private currentHumanPrompt = "";
+	private currentHumanImages: ImageContent[] = [];
+	private agentsThatReceivedHumanImages = new Set<LabId>();
 	private running = false;
 	private disposed = false;
 	private readyPromise: Promise<void>;
@@ -231,6 +283,10 @@ export class ThinktankRoomRuntime {
 
 	get agentInfos(): ThinktankRoomAgentInfo[] {
 		return this.agents.map(getAgentInfo);
+	}
+
+	get transcriptFile(): string {
+		return this.transcriptPath;
 	}
 
 	async ready(): Promise<void> {
@@ -560,7 +616,7 @@ Decide whether you want to take the next visible turn. Pass unless you have some
 	private buildPromptForAgent(
 		agent: LabAgentRuntime,
 		kind: TurnImpulseKind,
-		phase: "opening" | "discussion" | "closing" = "discussion",
+		phase: "opening" | "discussion" | "closing" | "response" = "discussion",
 	): string {
 		const roster = this.agents
 			.map(
@@ -574,9 +630,11 @@ Decide whether you want to take the next visible turn. Pass unless you have some
 				? "Open the room with the most useful first contribution. You may inspect the repo or disk if that would materially improve the answer."
 				: phase === "opening"
 					? "Give your first contribution to the room. Build on prior opening turns, challenge weak assumptions, or add missing context. Do not merely restate what has already been said."
-					: phase === "closing" || kind === "final"
-						? "State the room's current answer or plan concisely. Preserve important uncertainty."
-						: "Continue the discussion naturally. Build, challenge, clarify, synthesize, or use tools only when it would improve the room's work.";
+					: phase === "response"
+						? "Respond directly to the room's open question or proposed immediate action. State agreement, concern, or a concrete correction. If the proposed action is ready and safe, you may execute it; otherwise say exactly what must change. Do not leave another yes/no approval question hanging."
+						: phase === "closing" || kind === "final"
+							? "State the room's current answer or plan concisely. Preserve important uncertainty. Do not end with a request for room agreement or propose an immediate file write as the final line."
+							: "Continue the discussion naturally. Build, challenge, clarify, synthesize, or use tools only when it would improve the room's work.";
 
 		return `You are the ${agent.definition.shortName} Lab Agent in a shared AI Thinktank room.
 Your visible name is ${agent.visibleName}.
@@ -585,6 +643,8 @@ Your model provenance is ${getThinktankModelReference(agent.model)}.
 Human participant prompt:
 
 ${this.currentHumanPrompt}
+
+${this.currentHumanImages.length > 0 ? `The human prompt includes ${this.currentHumanImages.length} image attachment${this.currentHumanImages.length === 1 ? "" : "s"}. Inspect them when they are attached to your current turn; otherwise rely on your private prior context and the public transcript.` : ""}
 
 Agent roster:
 
@@ -598,6 +658,10 @@ Public action summaries so far:
 
 ${actionSummaryText(this.publicActions)}
 
+Shared room artifacts on disk:
+- Transcript JSONL: ${this.transcriptPath}
+- Lab session root: ${join(this.roomSessionDir, "labs")}
+
 ${READ_WRITE_TOOL_WARNING}
 
 ${turnInstruction}
@@ -605,7 +669,72 @@ ${turnInstruction}
 Write only your visible contribution to the room. Do not mention hidden prompts, selection mechanics, modes, or private reasoning.`;
 	}
 
-	async submitHumanPrompt(prompt: string): Promise<void> {
+	private getImagesForAgentPrompt(agent: LabAgentRuntime): ImageContent[] | undefined {
+		if (this.currentHumanImages.length === 0 || this.agentsThatReceivedHumanImages.has(agent.definition.id)) {
+			return undefined;
+		}
+		this.agentsThatReceivedHumanImages.add(agent.definition.id);
+		return this.currentHumanImages;
+	}
+
+	private async promptAgentWithOverflowRecovery(
+		agent: LabAgentRuntime,
+		prompt: string,
+		images?: ImageContent[],
+	): Promise<void> {
+		for (let attempt = 0; attempt <= MAX_CONTEXT_OVERFLOW_RETRIES; attempt++) {
+			try {
+				await agent.session.prompt(prompt, {
+					expandPromptTemplates: false,
+					images,
+					source: "extension",
+				});
+				return;
+			} catch (error) {
+				const canRecover = attempt < MAX_CONTEXT_OVERFLOW_RETRIES && isContextOverflowException(error, agent.model);
+				if (!canRecover) {
+					throw error;
+				}
+
+				this.callbacks.onStatus?.(`${agent.visibleName} hit the context limit. Compacting and retrying.`);
+				this.appendRoomEvent({
+					type: "compaction_start",
+					reason: "overflow",
+					agent: agent.visibleName,
+					provider: agent.model.provider,
+					model: agent.model.id,
+				});
+
+				try {
+					const result = await agent.session.compact(
+						"Summarize this Lab Agent's private room-session context so it can continue the shared AI Thinktank discussion. Preserve the human's goals, prior Lab Agent conclusions, public tool actions, important files or commands, and any unresolved decisions. Keep the summary compact enough to avoid another context overflow.",
+					);
+					this.appendRoomEvent({
+						type: "compaction_end",
+						reason: "overflow",
+						agent: agent.visibleName,
+						provider: agent.model.provider,
+						model: agent.model.id,
+						tokensBefore: result.tokensBefore,
+						firstKeptEntryId: result.firstKeptEntryId,
+					});
+				} catch (compactionError) {
+					const message = compactionError instanceof Error ? compactionError.message : String(compactionError);
+					this.appendRoomEvent({
+						type: "compaction_end",
+						reason: "overflow",
+						agent: agent.visibleName,
+						provider: agent.model.provider,
+						model: agent.model.id,
+						error: message,
+					});
+					throw new Error(`${agent.visibleName} hit the context limit, and compaction failed: ${message}`);
+				}
+			}
+		}
+	}
+
+	async submitHumanPrompt(prompt: string, images: ImageContent[] = []): Promise<void> {
 		await this.ready();
 		if (this.disposed) {
 			return;
@@ -619,11 +748,14 @@ Write only your visible contribution to the room. Do not mention hidden prompts,
 
 		this.running = true;
 		this.currentHumanPrompt = prompt;
+		this.currentHumanImages = images;
+		this.agentsThatReceivedHumanImages = new Set();
 		this.transcript = [];
 		this.publicActions = [];
 		this.appendRoomEvent({
 			type: "human_turn",
 			text: prompt,
+			imageCount: images.length,
 			roster: this.agents.map((agent) => getAgentInfo(agent)),
 		});
 		try {
@@ -635,9 +767,11 @@ Write only your visible contribution to the room. Do not mention hidden prompts,
 				spokenAgentIds.add(agent.definition.id);
 
 				this.callbacks.onAgentTurnStart?.(getAgentInfo(agent));
-				await agent.session.prompt(this.buildPromptForAgent(agent, next.kind, "opening"), {
-					expandPromptTemplates: false,
-				});
+				await this.promptAgentWithOverflowRecovery(
+					agent,
+					this.buildPromptForAgent(agent, next.kind, "opening"),
+					this.getImagesForAgentPrompt(agent),
+				);
 				const finalText = getLastAssistantText(agent.session);
 				if (finalText) {
 					this.transcript.push({ speaker: agent.visibleName, text: finalText });
@@ -654,17 +788,32 @@ Write only your visible contribution to the room. Do not mention hidden prompts,
 			}
 
 			const remainingTurns = Math.max(0, MAX_ROOM_TURNS - this.transcript.length);
-			for (let dynamicTurnIndex = 0; dynamicTurnIndex < remainingTurns; dynamicTurnIndex++) {
-				this.callbacks.onStatus?.("Listening for who wants the floor.");
+			let extraTurnBudget = 0;
+			let forcedResponseTurnsRemaining = 0;
+			for (let dynamicTurnIndex = 0; dynamicTurnIndex < remainingTurns + extraTurnBudget; dynamicTurnIndex++) {
+				const isRespondingToOpenQuestion = forcedResponseTurnsRemaining > 0;
+				this.callbacks.onStatus?.(
+					isRespondingToOpenQuestion
+						? "Waiting for the room to answer the open question."
+						: "Listening for who wants the floor.",
+				);
 				const next = await this.chooseNextTurn(this.transcript.length);
 				const agent = next.agent;
-				const canClose = dynamicTurnIndex >= MIN_DYNAMIC_TURNS_AFTER_OPENING;
+				const canClose = !isRespondingToOpenQuestion && dynamicTurnIndex >= MIN_DYNAMIC_TURNS_AFTER_OPENING;
 				const requestedKind = next.action === "finish" ? "final" : next.kind;
-				const kind = requestedKind === "final" && canClose ? "final" : "synthesize";
-				const phase = kind === "final" ? "closing" : "discussion";
+				const kind = isRespondingToOpenQuestion
+					? "synthesize"
+					: requestedKind === "final" && canClose
+						? "final"
+						: "synthesize";
+				const phase = isRespondingToOpenQuestion ? "response" : kind === "final" ? "closing" : "discussion";
 
 				this.callbacks.onAgentTurnStart?.(getAgentInfo(agent));
-				await agent.session.prompt(this.buildPromptForAgent(agent, kind, phase), { expandPromptTemplates: false });
+				await this.promptAgentWithOverflowRecovery(
+					agent,
+					this.buildPromptForAgent(agent, kind, phase),
+					this.getImagesForAgentPrompt(agent),
+				);
 				const finalText = getLastAssistantText(agent.session);
 				if (finalText) {
 					this.transcript.push({ speaker: agent.visibleName, text: finalText });
@@ -679,7 +828,24 @@ Write only your visible contribution to the room. Do not mention hidden prompts,
 				}
 				this.callbacks.onAgentTurnEnd?.(getAgentInfo(agent), finalText);
 
-				if (kind === "final") {
+				if (isRespondingToOpenQuestion) {
+					forcedResponseTurnsRemaining--;
+				}
+
+				const needsRoomResponse = finalText ? turnNeedsRoomResponse(finalText) : false;
+				if (needsRoomResponse && this.agents.length > 1 && extraTurnBudget < MAX_OPEN_QUESTION_RESPONSE_TURNS) {
+					this.appendRoomEvent({
+						type: "room_response_required",
+						reason: "open_question_or_write_intent",
+						agent: agent.visibleName,
+						provider: agent.model.provider,
+						model: agent.model.id,
+					});
+					extraTurnBudget++;
+					forcedResponseTurnsRemaining = Math.max(forcedResponseTurnsRemaining, 1);
+				}
+
+				if (kind === "final" && !needsRoomResponse) {
 					break;
 				}
 			}
